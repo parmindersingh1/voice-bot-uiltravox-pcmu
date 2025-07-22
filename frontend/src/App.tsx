@@ -15,16 +15,24 @@ interface WebSocketMessage {
 
 // Global variables
 let socket: WebSocket | null = null;
-let processor: ScriptProcessorNode | null = null;
 let audioContext: AudioContext | null = null;
 let stream: MediaStream | null = null;
-let currentAudio: HTMLAudioElement | null = null;
+let mediaRecorder: MediaRecorder | null = null;
+let audioWorkletNode: AudioWorkletNode | null = null;
+let isRecording = false;
+
+// Audio playback globals
+let playbackContext: AudioContext | null = null;
+let audioBuffer: Float32Array[] = [];
+let isPlayingAudio = false;
+let nextPlayTime = 0;
 
 const App: React.FC = () => {
   const [context, setContext] = React.useState<string>("");
   const [userText, setUserText] = React.useState<string>("...");
   const [agentText, setAgentText] = React.useState<string>("...");
   const [isConnected, setIsConnected] = React.useState<boolean>(false);
+  const [bufferSize, setBufferSize] = React.useState<number>(4096);
 
   const startConversation = async () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -42,28 +50,52 @@ const App: React.FC = () => {
   };
 
   const stopConversation = () => {
+    cleanup();
+    setIsConnected(false);
+    console.log("🛑 Stopped conversation and cleaned up");
+  };
+
+  const cleanup = () => {
+    // Stop WebSocket
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.close();
       socket = null;
-      console.log("🛑 WebSocket closed");
     }
 
-    if (processor) {
-      processor.disconnect();
-      processor.onaudioprocess = null;
+    // Stop recording
+    isRecording = false;
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    mediaRecorder = null;
+
+    // Stop audio worklet
+    if (audioWorkletNode) {
+      audioWorkletNode.disconnect();
+      audioWorkletNode = null;
     }
 
+    // Stop stream
     if (stream) {
       stream.getTracks().forEach((track) => track.stop());
+      stream = null;
     }
 
+    // Close audio contexts
     if (audioContext) {
       audioContext.close();
       audioContext = null;
     }
 
-    setIsConnected(false);
-    console.log("🛑 Stopped mic stream and cleaned up");
+    if (playbackContext) {
+      playbackContext.close();
+      playbackContext = null;
+    }
+
+    // Clear playback buffers
+    audioBuffer = [];
+    isPlayingAudio = false;
+    nextPlayTime = 0;
   };
 
   const connectToWebsocket = (url: string) => {
@@ -78,8 +110,8 @@ const App: React.FC = () => {
       const data = event.data;
 
       if (data instanceof ArrayBuffer) {
-        console.log("🎧 Playing audio response...");
-        playAudio(data);
+        console.log(`🎧 Received audio chunk: ${data.byteLength} bytes`);
+        handleIncomingAudio(data);
       } else {
         const msg: WebSocketMessage = JSON.parse(data);
         console.log("📨 Received message:", msg);
@@ -89,14 +121,9 @@ const App: React.FC = () => {
         } else if (msg.type === "response") {
           setAgentText(msg.text || "(no reply)");
         } else if (msg.type === "playback_clear_buffer") {
-          if (currentAudio) {
-            currentAudio.pause();
-            currentAudio.src = "";
-            currentAudio = null;
-            console.log("🧹 Audio buffer cleared");
-          }
+          clearAudioBuffers();
         } else if (msg.type === "connected") {
-          startMicStream();
+          initializeAudio();
           setIsConnected(true);
         } else if (msg.error) {
           console.error("❌ Server error:", msg.error);
@@ -109,115 +136,331 @@ const App: React.FC = () => {
     socket.onclose = () => {
       console.log("🔌 Socket closed by server");
       setIsConnected(false);
+      cleanup();
     };
   };
 
-  const startMicStream = async () => {
+  const initializeAudio = async () => {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioContext = new AudioContext({ sampleRate: 48000 });
-      console.log("🎛️ Actual mic sample rate:", audioContext.sampleRate);
+      // Initialize playback context first
+      playbackContext = new AudioContext({ 
+        sampleRate: 48000,
+        latencyHint: 'interactive'
+      });
+      await playbackContext.resume();
 
-      const source: MediaStreamAudioSourceNode =
-        audioContext.createMediaStreamSource(stream);
-      processor = audioContext.createScriptProcessor(8192, 1, 1);
+      // Initialize recording
+      await initializeRecording();
+      
+      console.log("🎛️ Audio system initialized");
+    } catch (err) {
+      console.error("❌ Failed to initialize audio:", err);
+      alert("Audio initialization failed");
+    }
+  };
 
+  const initializeRecording = async () => {
+    try {
+      const constraints = {
+        audio: {
+          sampleRate: 48000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false, // Disable AGC to prevent artifacts
+          googEchoCancellation: true,
+          googNoiseSuppression: true,
+          googAutoGainControl: false
+        }
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      
+      // Use MediaRecorder for cleaner audio capture
+      const options = {
+        mimeType: 'audio/webm;codecs=pcm',
+        audioBitsPerSecond: 768000 // High bitrate for quality
+      };
+
+      // Fallback MIME types if PCM not supported
+      const supportedTypes = [
+        'audio/webm;codecs=pcm',
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4'
+      ];
+
+      let mimeType = '';
+      for (const type of supportedTypes) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          mimeType = type;
+          break;
+        }
+      }
+
+      if (!mimeType) {
+        throw new Error('No supported audio format found');
+      }
+
+      console.log(`🎙️ Using MIME type: ${mimeType}`);
+      
+      mediaRecorder = new MediaRecorder(stream, { 
+        mimeType,
+        audioBitsPerSecond: 768000 
+      });
+
+      let audioChunks: Blob[] = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        if (audioChunks.length > 0) {
+          const audioBlob = new Blob(audioChunks, { type: mimeType });
+          await processAudioBlob(audioBlob);
+          audioChunks = [];
+        }
+      };
+
+      // Start recording with small intervals for low latency
+      mediaRecorder.start(100); // 100ms chunks
+      isRecording = true;
+
+      // Set up interval to process chunks
+      const recordingInterval = setInterval(() => {
+        if (!isRecording || !mediaRecorder || mediaRecorder.state === 'inactive') {
+          clearInterval(recordingInterval);
+          return;
+        }
+        
+        if (mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+          mediaRecorder.start(100);
+        }
+      }, 100);
+
+      console.log("🎙️ MediaRecorder started");
+    } catch (err) {
+      console.error("❌ Failed to initialize recording:", err);
+      // Fallback to Web Audio API
+      await initializeWebAudioRecording();
+    }
+  };
+
+  const initializeWebAudioRecording = async () => {
+    try {
+      audioContext = new AudioContext({ 
+        sampleRate: 48000,
+        latencyHint: 'interactive'
+      });
+      await audioContext.resume();
+
+      const source = audioContext.createMediaStreamSource(stream!);
+      
+      // Create a ScriptProcessor as fallback
+      const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+      
       source.connect(processor);
       processor.connect(audioContext.destination);
 
       processor.onaudioprocess = (e: AudioProcessingEvent) => {
-        const input: Float32Array = e.inputBuffer.getChannelData(0);
-        const buffer: ArrayBuffer = convertFloat32ToInt16(input);
-        if (socket && socket.readyState === WebSocket.OPEN) {
+        if (!isRecording) return;
+        
+        const input = e.inputBuffer.getChannelData(0);
+        const smoothedInput = applySmoothing(input);
+        const buffer = convertFloat32ToInt16Smooth(smoothedInput);
+        
+        if (socket && socket.readyState === WebSocket.OPEN && buffer.byteLength > 0) {
           socket.send(buffer);
         }
       };
 
-      console.log("🎙️ Mic stream started");
+      console.log("🎙️ Web Audio recording started as fallback");
     } catch (err) {
-      console.error("❌ Failed to access microphone:", err);
-      alert("Microphone permission denied or not available");
+      console.error("❌ Web Audio recording failed:", err);
+      throw err;
     }
   };
 
-  const convertFloat32ToInt16 = (buffer: Float32Array): ArrayBuffer => {
-    const l: number = buffer.length;
-    const buf: Int16Array = new Int16Array(l);
-    for (let i = 0; i < l; i++) {
-      buf[i] = Math.max(-1, Math.min(1, buffer[i])) * 32767;
-    }
-    return buf.buffer;
-  };
-
-  const playAudio = (arrayBuffer: ArrayBuffer) => {
+  const processAudioBlob = async (blob: Blob) => {
     try {
-      const wavBuffer: ArrayBuffer = encodeWav(arrayBuffer, {
-        channels: 1,
-        sampleRate: 48000,
-        bitDepth: 16,
-      });
+      const arrayBuffer = await blob.arrayBuffer();
+      
+      if (!playbackContext) return;
 
-      const blob: Blob = new Blob([wavBuffer], { type: "audio/wav" });
-      const url: string = URL.createObjectURL(blob);
-      const audio: HTMLAudioElement = new Audio(url);
-      currentAudio = audio;
-
-      audio.play().catch((err: Error) => {
-        console.error("🔈 Playback error:", err);
-      });
+      // Decode the audio to get raw PCM data
+      const audioBuffer = await playbackContext.decodeAudioData(arrayBuffer);
+      const channelData = audioBuffer.getChannelData(0);
+      
+      // Convert to 16-bit PCM and send
+      const pcmBuffer = convertFloat32ToInt16Smooth(channelData);
+      
+      if (socket && socket.readyState === WebSocket.OPEN && pcmBuffer.byteLength > 0) {
+        socket.send(pcmBuffer);
+      }
     } catch (err) {
-      console.error("🎧 Failed to play audio:", err);
+      console.error("❌ Failed to process audio blob:", err);
     }
   };
 
-  interface EncodeWavOptions {
-    channels?: number;
-    sampleRate?: number;
-    bitDepth?: number;
-  }
-
-  const encodeWav = (
-    samples: ArrayBuffer,
-    options: EncodeWavOptions
-  ): ArrayBuffer => {
-    const { channels = 1, sampleRate = 48000, bitDepth = 16 } = options;
-    const bytesPerSample: number = bitDepth / 8;
-    const blockAlign: number = channels * bytesPerSample;
-    const byteRate: number = sampleRate * blockAlign;
-    const dataSize: number = samples.byteLength;
-
-    const buffer: ArrayBuffer = new ArrayBuffer(44 + dataSize);
-    const view: DataView = new DataView(buffer);
-
-    writeString(view, 0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    writeString(view, 8, "WAVE");
-    writeString(view, 12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
-    view.setUint16(22, channels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitDepth, true);
-    writeString(view, 36, "data");
-    view.setUint32(40, dataSize, true);
-
-    new Uint8Array(buffer, 44).set(new Uint8Array(samples));
-    return buffer;
+  const applySmoothing = (input: Float32Array): Float32Array => {
+    const smoothed = new Float32Array(input.length);
+    const alpha = 0.1; // Smoothing factor
+    let prev = 0;
+    
+    for (let i = 0; i < input.length; i++) {
+      smoothed[i] = alpha * input[i] + (1 - alpha) * prev;
+      prev = smoothed[i];
+    }
+    
+    return smoothed;
   };
 
-  const writeString = (view: DataView, offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
+  const convertFloat32ToInt16Smooth = (buffer: Float32Array): ArrayBuffer => {
+    const length = buffer.length;
+    const result = new Int16Array(length);
+    
+    for (let i = 0; i < length; i++) {
+      // Apply soft limiting to prevent harsh clipping
+      let sample = buffer[i];
+      sample = Math.tanh(sample * 0.9); // Soft saturation
+      sample = Math.max(-1, Math.min(1, sample));
+      result[i] = Math.round(sample * 32767);
     }
+    
+    return result.buffer;
+  };
+
+  const handleIncomingAudio = async (arrayBuffer: ArrayBuffer) => {
+    try {
+      if (!playbackContext) {
+        playbackContext = new AudioContext({ 
+          sampleRate: 48000,
+          latencyHint: 'interactive'
+        });
+        await playbackContext.resume();
+      }
+
+      // Convert raw PCM to audio buffer
+      const audioData = await createAudioBufferFromPCM(arrayBuffer);
+      if (audioData) {
+        scheduleAudioPlayback(audioData);
+      }
+    } catch (err) {
+      console.error("🎧 Audio playback error:", err);
+    }
+  };
+
+  const createAudioBufferFromPCM = async (arrayBuffer: ArrayBuffer): Promise<AudioBuffer | null> => {
+    try {
+      if (!playbackContext) return null;
+
+      const int16Array = new Int16Array(arrayBuffer);
+      const float32Array = new Float32Array(int16Array.length);
+      
+      // Convert Int16 to Float32 with proper scaling
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768; // Proper scaling
+      }
+
+      // Create AudioBuffer
+      const audioBuffer = playbackContext.createBuffer(1, float32Array.length, 48000);
+      audioBuffer.copyToChannel(float32Array, 0);
+
+      return audioBuffer;
+    } catch (err) {
+      console.error("❌ Failed to create audio buffer:", err);
+      return null;
+    }
+  };
+
+  const scheduleAudioPlayback = (audioBuffer: AudioBuffer) => {
+    if (!playbackContext) return;
+
+    const source = playbackContext.createBufferSource();
+    source.buffer = audioBuffer;
+
+    // Apply gentle filtering to reduce artifacts
+    const filter = playbackContext.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(8000, playbackContext.currentTime);
+    filter.Q.setValueAtTime(0.5, playbackContext.currentTime);
+
+    // Add slight reverb for smoothness
+    const convolver = playbackContext.createConvolver();
+    const impulse = createImpulseResponse(playbackContext, 0.02, 0.3, false);
+    convolver.buffer = impulse;
+
+    source.connect(filter);
+    filter.connect(convolver);
+    convolver.connect(playbackContext.destination);
+
+    // Schedule playback
+    const now = playbackContext.currentTime;
+    if (nextPlayTime <= now) {
+      nextPlayTime = now;
+    }
+
+    source.start(nextPlayTime);
+    nextPlayTime += audioBuffer.duration;
+
+    // Clean up
+    source.onended = () => {
+      source.disconnect();
+      filter.disconnect();
+      convolver.disconnect();
+    };
+  };
+
+  const createImpulseResponse = (
+    context: AudioContext, 
+    duration: number, 
+    decay: number, 
+    reverse: boolean
+  ): AudioBuffer => {
+    const length = context.sampleRate * duration;
+    const impulse = context.createBuffer(2, length, context.sampleRate);
+    
+    for (let channel = 0; channel < 2; channel++) {
+      const channelData = impulse.getChannelData(channel);
+      for (let i = 0; i < length; i++) {
+        const n = reverse ? length - i : i;
+        channelData[i] = (Math.random() * 2 - 1) * Math.pow(1 - n / length, decay);
+      }
+    }
+    
+    return impulse;
+  };
+
+  const clearAudioBuffers = () => {
+    audioBuffer = [];
+    nextPlayTime = 0;
+    console.log("🧹 Audio buffers cleared");
   };
 
   return (
     <div className="min-h-screen bg-gray-100 p-8 text-gray-800">
       <h1 className="text-2xl font-bold mb-6">
-        🎤 Real-Time AI Meeting Assistant
+        🎤 Real-Time AI Meeting Assistant (Enhanced Audio)
       </h1>
+      
+      <div className="mb-4">
+        <label className="block text-sm font-medium mb-2">Audio Buffer Size:</label>
+        <select 
+          value={bufferSize} 
+          onChange={(e) => setBufferSize(parseInt(e.target.value))}
+          className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          disabled={isConnected}
+        >
+          <option value={2048}>2048 (Lowest Latency)</option>
+          <option value={4096}>4096 (Balanced)</option>
+          <option value={8192}>8192 (Highest Quality)</option>
+        </select>
+      </div>
+
       <div className="flex items-center space-x-2 mb-4">
         <input
           type="text"
@@ -251,6 +494,13 @@ const App: React.FC = () => {
           Stop
         </button>
       </div>
+
+      <div className="mb-4 text-sm text-gray-600">
+        Status: {isConnected ? "🟢 Connected" : "🔴 Disconnected"} | 
+        Recording: {isRecording ? "🎙️ Active" : "⏸️ Inactive"} | 
+        Playback: {isPlayingAudio ? "🔊 Playing" : "🔇 Silent"}
+      </div>
+
       <div className="space-y-4">
         <div className="p-4 bg-white rounded-lg shadow-md border-l-4 border-blue-500 max-w-3xl">
           <span className="font-semibold">🗣️ You: </span>
