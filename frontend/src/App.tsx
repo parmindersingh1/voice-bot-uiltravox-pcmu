@@ -44,7 +44,8 @@ const App: React.FC = () => {
       return;
     }
 
-    const wsUrl = `ws://localhost:3001?context=${encodeURIComponent(context)}`;
+    // const wsUrl = `ws://localhost:3001?context=${encodeURIComponent(context)}`;
+    const wsUrl = `ws://localhost:8765?context=${encodeURIComponent(context)}&sampleRate=${sampleRate}`;
     connectToWebsocket(wsUrl);
   };
 

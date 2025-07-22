@@ -150,12 +150,16 @@ wss.on('connection', async (clientWs, req) => {
         voice: 'Mark', // Consider trying different voices: 'Terrence', 'Sarah', 'Mark', 'Amy'
         medium: {
           serverWebSocket: {
-            inputSampleRate: 48000,
-            outputSampleRate: 48000,
-            // clientBufferSizeMs: 60
-            // inputEncoding: 'pcm_s16le', // Ensure 16-bit PCM
-            // outputEncoding: 'pcm_s16le'
+            inputSampleRate: 48000,  // Accept 48kHz from client after we upsample
+            outputSampleRate: 48000,  // Receive 48kHz from Ultravox
+            clientBufferSizeMs: 160  // Larger buffer for stability
           },
+        },
+        vadSettings: {
+            turnEndpointDelay: "0.384s",  // Default, but can be adjusted
+            minimumTurnDuration: "0s",
+            minimumInterruptionDuration: "0.09s",
+            frameActivationThreshold: 0.1  // Lower = more sensitive
         },
          "firstSpeaker": "FIRST_SPEAKER_AGENT",
         // Add audio quality parameters
@@ -215,17 +219,21 @@ wss.on('connection', async (clientWs, req) => {
                 return;
               }
               
-              // Downsample 48kHz to 8kHz for client
-              const downsampled = resampleAudio(data, 48000, 8000);
-              if (downsampled.byteLength === 0) {
+              // Downsample from 48kHz to 8kHz
+              const downsampledBuffer = resampleAudio(data, 48000, 8000);
+              if (downsampledBuffer.byteLength === 0) {
                 console.log('🔇 Empty after downsampling');
                 return;
               }
               
-              console.log(`📉 Downsampled: ${downsampled.byteLength} bytes`);
+              // Convert downsampled PCM16 to PCMU
+              const pcmuBuffer = convertPcm16ToPcmu(downsampledBuffer);
+              if (pcmuBuffer.byteLength === 0) {
+                console.log('🔇 Empty buffer');
+                return;
+              }
               
-              // Convert to PCMU for client
-              const pcmuBuffer = convertPcm16ToPcmu(downsampled);
+              console.log(`� Converted to PCMU: ${pcmuBuffer.byteLength} bytes`);
               console.log(`🔄 Converted to PCMU: ${pcmuBuffer.byteLength} bytes`);
               
               // Validate PCMU output
@@ -321,14 +329,20 @@ wss.on('connection', async (clientWs, req) => {
                 return;
               }
               
-              console.log(`🔄 Converted to PCM16: ${pcm16Buffer.byteLength} bytes, max: ${maxAmplitude}`);
+              console.log(`🔄 Converted to PCM16 (8kHz): ${pcm16Buffer.byteLength} bytes, max: ${maxAmplitude}`);
               
-              // Resample from 8kHz to 48kHz 
-              const resampledBuffer = resampleAudio(pcm16Buffer, 8000, 48000);
-              console.log(`📈 Resampled to 48kHz: ${resampledBuffer.byteLength} bytes`);
+              // Upsample from 8kHz to 48kHz for Ultravox
+              const upsampledBuffer = resampleAudio(pcm16Buffer, 8000, 48000);
               
-              // Send to Ultravox
-              ultravoxWs.send(resampledBuffer);
+              // Validate upsampled data
+              const upsampledSamples = new Int16Array(upsampledBuffer);
+              if (upsampledSamples.length === 0) {
+                console.log('🔇 Empty after upsampling');
+                return;
+              }
+              
+              console.log(`📈 Upsampled to 48kHz: ${upsampledBuffer.byteLength} bytes`);
+              ultravoxWs.send(upsampledBuffer);
             } catch (conversionErr) {
               console.error('❌ Audio conversion error:', conversionErr);
             }
@@ -389,5 +403,5 @@ app.listen(port, () => {
   console.log(`🚀 Server running at http://localhost:${port}`);
   console.log(`🌐 WebSocket server running at ws://localhost:3001`);
   console.log(`🏥 Health check available at http://localhost:${port}/health`);
-  console.log(`🎵 Audio pipeline: PCMU 8kHz (client) → PCM16 48kHz (Ultravox)`);
+  console.log(`🎵 Audio pipeline: PCMU 8kHz (client) ↔ PCM16 8kHz (Ultravox)`);
 });
