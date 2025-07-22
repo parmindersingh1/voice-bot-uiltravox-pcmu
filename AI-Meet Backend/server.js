@@ -152,10 +152,12 @@ wss.on('connection', async (clientWs, req) => {
           serverWebSocket: {
             inputSampleRate: 48000,
             outputSampleRate: 48000,
+            // clientBufferSizeMs: 60
             // inputEncoding: 'pcm_s16le', // Ensure 16-bit PCM
             // outputEncoding: 'pcm_s16le'
           },
         },
+         "firstSpeaker": "FIRST_SPEAKER_AGENT",
         // Add audio quality parameters
         // maxDuration: 3600, // 1 hour max
         recordingEnabled: false, // Disable recording for better performance

@@ -203,7 +203,7 @@ const App: React.FC = () => {
       class PCMUProcessor extends AudioWorkletProcessor {
         constructor() {
           super();
-          this.chunkSize = 160; // 20ms at 8kHz
+          this.chunkSize = 320; // 40ms at 8kHz
           this.buffer = new Float32Array(this.chunkSize);
           this.bufferIndex = 0;
         }
@@ -274,7 +274,7 @@ const App: React.FC = () => {
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true, // Re-enable AGC
+          autoGainControl: false, // Re-enable AGC
         }
       };
 
@@ -422,7 +422,7 @@ const App: React.FC = () => {
       
       <div className="mb-4">
         <div className="text-sm text-gray-600 mb-2">
-          Sample Rate: {sampleRate}Hz | PCMU (µ-law) Encoding | 160 samples/chunk (20ms)
+          Sample Rate: {sampleRate}Hz | PCMU (µ-law) Encoding | 320 samples/chunk (40ms)
         </div>
       </div>
 
