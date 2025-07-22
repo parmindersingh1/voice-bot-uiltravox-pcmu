@@ -20,18 +20,18 @@ let stream: MediaStream | null = null;
 let workletNode: AudioWorkletNode | null = null;
 let isRecording = false;
 
-// Audio playback globals (similar to audio-streamer pattern)
+// Audio playback globals
 let playbackContext: AudioContext | null = null;
 let audioQueue: ArrayBuffer[] = [];
 let isAudioPlaying = false;
-let currentSourceNode: AudioBufferSourceNode | null = null;
+let nextPlayTime = 0;
 
 const App: React.FC = () => {
   const [context, setContext] = React.useState<string>("");
   const [userText, setUserText] = React.useState<string>("...");
   const [agentText, setAgentText] = React.useState<string>("...");
   const [isConnected, setIsConnected] = React.useState<boolean>(false);
-  const [sampleRate] = React.useState<number>(48000); // Fixed sample rate
+  const [sampleRate] = React.useState<number>(8000);
 
   const startConversation = async () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -77,17 +77,17 @@ const App: React.FC = () => {
     }
 
     // Close audio contexts
-    if (audioContext) {
+    if (audioContext && audioContext.state !== 'closed') {
       audioContext.close();
       audioContext = null;
     }
 
-    if (playbackContext) {
+    if (playbackContext && playbackContext.state !== 'closed') {
       playbackContext.close();
       playbackContext = null;
     }
 
-    // Clear playback buffers (audio-streamer pattern)
+    // Clear playback buffers
     stopAudioPlayback();
   };
 
@@ -104,7 +104,6 @@ const App: React.FC = () => {
 
       if (data instanceof ArrayBuffer) {
         console.log(`🎧 Received audio chunk: ${data.byteLength} bytes`);
-        // Use audio-streamer pattern for handling incoming audio
         handleIncomingAudioBuffer(data);
       } else {
         const msg: WebSocketMessage = JSON.parse(data);
@@ -136,14 +135,20 @@ const App: React.FC = () => {
 
   const initializeAudio = async () => {
     try {
-      // Initialize playback context first
+      // Initialize playback context with proper settings
       playbackContext = new AudioContext({ 
         sampleRate,
         latencyHint: 'interactive'
       });
-      await playbackContext.resume();
+      
+      // Resume context if suspended
+      if (playbackContext.state === 'suspended') {
+        await playbackContext.resume();
+      }
+      
+      console.log(`🎛️ Playback context: ${playbackContext.sampleRate}Hz, state: ${playbackContext.state}`);
 
-      // Initialize recording using audio-streamer pattern
+      // Initialize recording
       await initializeRecording();
       
       console.log("🎛️ Audio system initialized");
@@ -153,15 +158,75 @@ const App: React.FC = () => {
     }
   };
 
-  // Audio worklet processor code (similar to audio-streamer PCMProcessor)
-  const getPcmProcessorCode = (): string => {
+  // Improved µ-law encoding with proper bit manipulation
+  const linearToPcmu = (sample: number): number => {
+    const BIAS = 0x84;
+    const CLIP = 32635;
+    
+    // Clamp input
+    sample = Math.max(-32768, Math.min(32767, sample));
+    
+    let sign = (sample >> 8) & 0x80;
+    if (sign) sample = -sample;
+    
+    if (sample > CLIP) sample = CLIP;
+    sample += BIAS;
+    
+    let exponent = 7;
+    for (let exp_lut = 0x4000; sample < exp_lut && exponent > 0; exp_lut >>= 1, exponent--);
+    
+    const mantissa = (sample >> (exponent + 3)) & 0x0F;
+    const companded = ~(sign | (exponent << 4) | mantissa);
+    
+    return companded & 0xFF;
+  };
+
+  // Improved µ-law decoding
+  const pcmuToLinear = (pcmu: number): number => {
+    const BIAS = 0x84;
+    
+    pcmu = ~pcmu;
+    const sign = pcmu & 0x80;
+    const exponent = (pcmu >> 4) & 0x07;
+    const mantissa = pcmu & 0x0F;
+    
+    let sample = mantissa << (exponent + 3);
+    sample += BIAS;
+    if (exponent === 0) sample -= 4;
+    
+    return sign ? -sample : sample;
+  };
+
+  // Updated audio worklet processor with better buffering
+  const getPcmuProcessorCode = (): string => {
     return `
-      class PCMProcessor extends AudioWorkletProcessor {
+      class PCMUProcessor extends AudioWorkletProcessor {
         constructor() {
           super();
-          this.chunkSize = 2048; // Smaller chunk size for lower latency
+          this.chunkSize = 160; // 20ms at 8kHz
           this.buffer = new Float32Array(this.chunkSize);
           this.bufferIndex = 0;
+        }
+
+        linearToPcmu(sample) {
+          const BIAS = 0x84;
+          const CLIP = 32635;
+          
+          sample = Math.max(-32768, Math.min(32767, sample));
+          
+          let sign = (sample >> 8) & 0x80;
+          if (sign) sample = -sample;
+          
+          if (sample > CLIP) sample = CLIP;
+          sample += BIAS;
+          
+          let exponent = 7;
+          for (let exp_lut = 0x4000; sample < exp_lut && exponent > 0; exp_lut >>= 1, exponent--);
+          
+          const mantissa = (sample >> (exponent + 3)) & 0x0F;
+          const companded = ~(sign | (exponent << 4) | mantissa);
+          
+          return companded & 0xFF;
         }
 
         process(inputs, outputs, parameters) {
@@ -174,12 +239,21 @@ const App: React.FC = () => {
             this.buffer[this.bufferIndex++] = samples[i];
 
             if (this.bufferIndex === this.chunkSize) {
-              const pcmData = new Int16Array(this.chunkSize);
+              const pcmuData = new Uint8Array(this.chunkSize);
+              let hasAudio = false;
+              
               for (let j = 0; j < this.chunkSize; j++) {
                 const sample = Math.max(-1, Math.min(1, this.buffer[j]));
-                pcmData[j] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                const pcm16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                pcmuData[j] = this.linearToPcmu(Math.round(pcm16));
+                if (Math.abs(sample) > 0.001) hasAudio = true; // Check for actual audio
               }
-              this.port.postMessage({ pcmData: pcmData.buffer });
+              
+              // Only send if we have actual audio content
+              if (hasAudio) {
+                this.port.postMessage({ pcmuData: pcmuData.buffer });
+              }
+              
               this.bufferIndex = 0;
             }
           }
@@ -188,7 +262,7 @@ const App: React.FC = () => {
         }
       }
 
-      registerProcessor("pcm-processor", PCMProcessor);
+      registerProcessor("pcmu-processor", PCMUProcessor);
     `;
   };
 
@@ -200,7 +274,7 @@ const App: React.FC = () => {
           channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: false,
+          autoGainControl: true, // Re-enable AGC
         }
       };
 
@@ -211,114 +285,144 @@ const App: React.FC = () => {
         sampleRate,
         latencyHint: 'interactive'
       });
-      await audioContext.resume();
+      
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+      
+      console.log(`🎙️ Recording context: ${audioContext.sampleRate}Hz, state: ${audioContext.state}`);
 
-      // Create and load audio worklet (audio-streamer pattern)
-      const processorCode = getPcmProcessorCode();
+      // Create and load audio worklet
+      const processorCode = getPcmuProcessorCode();
       const blob = new Blob([processorCode], { type: "application/javascript" });
       const blobUrl = URL.createObjectURL(blob);
 
       await audioContext.audioWorklet.addModule(blobUrl);
       URL.revokeObjectURL(blobUrl);
 
-      workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
+      workletNode = new AudioWorkletNode(audioContext, "pcmu-processor");
       
       const source = audioContext.createMediaStreamSource(stream);
       source.connect(workletNode);
-      workletNode.connect(audioContext.destination);
+      // Don't connect worklet to destination to avoid feedback
 
-      // Handle PCM data from worklet (audio-streamer pattern)
+      // Handle PCMU data from worklet
       workletNode.port.onmessage = (event) => {
-        if (event.data.pcmData && socket?.readyState === WebSocket.OPEN) {
-          const pcmData = event.data.pcmData;
-          socket.send(pcmData);
+        if (event.data.pcmuData && socket?.readyState === WebSocket.OPEN) {
+          socket.send(event.data.pcmuData);
         }
       };
 
       isRecording = true;
-      console.log("🎙️ Recording started with audio worklet");
+      console.log("🎙️ PCMU recording started");
     } catch (err) {
       console.error("❌ Failed to initialize recording:", err);
       throw err;
     }
   };
 
-  // Audio playback using audio-streamer pattern
+  // Improved audio playback with better scheduling
   const handleIncomingAudioBuffer = (arrayBuffer: ArrayBuffer) => {
-    // Add to queue like audio-streamer
     audioQueue.push(arrayBuffer);
     if (!isAudioPlaying && playbackContext) {
-      processAudioQueue();
+      scheduleAudioPlayback();
     }
   };
 
-  const processAudioQueue = async () => {
+  const scheduleAudioPlayback = async () => {
     if (audioQueue.length === 0) {
       isAudioPlaying = false;
       return;
     }
 
-    if (!playbackContext) return;
+    if (!playbackContext || playbackContext.state !== 'running') {
+      console.warn("⚠️ Playback context not ready");
+      return;
+    }
 
     isAudioPlaying = true;
 
-    const chunk = audioQueue.shift()!;
-    
-    try {
-      // Convert PCM data to AudioBuffer (audio-streamer style)
-      const samples = new Int16Array(chunk);
-      const audioBuffer = playbackContext.createBuffer(1, samples.length, sampleRate);
-      const audioData = audioBuffer.getChannelData(0);
+    while (audioQueue.length > 0) {
+      const chunk = audioQueue.shift()!;
       
-      // Convert Int16 to Float32 (audio-streamer conversion)
-      for (let i = 0; i < samples.length; i++) {
-        audioData[i] = samples[i] / 32768.0;
+      try {
+        // Convert PCMU data to AudioBuffer with better error handling
+        const pcmuSamples = new Uint8Array(chunk);
+        
+        // Validate data
+        if (pcmuSamples.length === 0) {
+          continue;
+        }
+        
+        const audioBuffer = playbackContext.createBuffer(1, pcmuSamples.length, sampleRate);
+        const audioData = audioBuffer.getChannelData(0);
+        
+        // Decode µ-law to linear PCM with validation
+        let hasValidAudio = false;
+        for (let i = 0; i < pcmuSamples.length; i++) {
+          const linearSample = pcmuToLinear(pcmuSamples[i]);
+          const normalizedSample = linearSample / 32768.0;
+          audioData[i] = Math.max(-1, Math.min(1, normalizedSample)); // Clamp to valid range
+          if (Math.abs(normalizedSample) > 0.001) hasValidAudio = true;
+        }
+        
+        // Only play if we have valid audio
+        if (!hasValidAudio) {
+          continue;
+        }
+
+        // Schedule playback with proper timing
+        const sourceNode = playbackContext.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+        
+        // Add a small gain node to control volume if needed
+        const gainNode = playbackContext.createGain();
+        gainNode.gain.setValueAtTime(1.0, playbackContext.currentTime);
+        
+        sourceNode.connect(gainNode);
+        gainNode.connect(playbackContext.destination);
+        
+        // Schedule with proper timing
+        const playTime = Math.max(playbackContext.currentTime, nextPlayTime);
+        sourceNode.start(playTime);
+        
+        // Update next play time (assume 20ms chunks)
+        nextPlayTime = playTime + audioBuffer.duration;
+        
+        console.log(`🔊 Scheduled audio chunk: ${pcmuSamples.length} samples at ${playTime.toFixed(3)}s`);
+
+      } catch (err) {
+        console.error("❌ Error processing audio chunk:", err);
       }
-
-      // Create and play buffer source
-      const sourceNode = playbackContext.createBufferSource();
-      sourceNode.buffer = audioBuffer;
-      sourceNode.connect(playbackContext.destination);
-      sourceNode.start();
-      currentSourceNode = sourceNode;
-
-      // Continue processing queue when this chunk ends
-      sourceNode.onended = () => {
-        processAudioQueue();
-      };
-
-    } catch (err) {
-      console.error("❌ Error processing audio chunk:", err);
-      // Continue with next chunk even if this one failed
-      processAudioQueue();
+      
+      // Small delay to prevent overwhelming the audio system
+      await new Promise(resolve => setTimeout(resolve, 1));
     }
+
+    isAudioPlaying = false;
   };
 
   const stopAudioPlayback = () => {
-    // Stop current playback (audio-streamer pattern)
-    if (currentSourceNode) {
-      try {
-        currentSourceNode.stop();
-        currentSourceNode.disconnect();
-      } catch (err) {
-        // Ignore errors if already stopped
-      }
-      currentSourceNode = null;
-    }
     audioQueue = [];
     isAudioPlaying = false;
+    nextPlayTime = 0;
+    
+    if (playbackContext) {
+      nextPlayTime = playbackContext.currentTime;
+    }
+    
     console.log("🧹 Audio playback stopped and queue cleared");
   };
 
   return (
     <div className="min-h-screen bg-gray-100 p-8 text-gray-800">
       <h1 className="text-2xl font-bold mb-6">
-        🎤 Real-Time AI Meeting Assistant (Audio-Streamer Pattern)
+        🎤 Real-Time AI Meeting Assistant (PCMU µ-law 8kHz) - Fixed Version
       </h1>
       
       <div className="mb-4">
         <div className="text-sm text-gray-600 mb-2">
-          Sample Rate: {sampleRate}Hz | Worklet-based Processing
+          Sample Rate: {sampleRate}Hz | PCMU (µ-law) Encoding | 160 samples/chunk (20ms)
         </div>
       </div>
 
