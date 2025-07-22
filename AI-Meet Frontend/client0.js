@@ -4,32 +4,38 @@ let audioContext = null;
 let stream = null;
 let currentAudio = null;
 
-const contextInput = document.getElementById('context');
-const transcriptText = document.getElementById('userText');
-const responseText = document.getElementById('agentText');
+const contextInput = document.getElementById("context");
+const transcriptText = document.getElementById("userText");
+const responseText = document.getElementById("agentText");
 
-document.getElementById('start').addEventListener('click', async () => {
+document.getElementById("start").addEventListener("click", async () => {
   if (socket && socket.readyState === WebSocket.OPEN) {
-    console.log('🟡 Already connected');
+    console.log("🟡 Already connected");
     return;
   }
 
   const context = contextInput.value.trim();
   if (!context) {
-    alert('Please enter context');
+    alert("Please enter context");
     return;
   }
 
-  // Connect to static WebSocket with context as query parameter
-  const wsUrl = `ws://localhost:3001?context=${encodeURIComponent(context)}`;
-  connectToUltravox(wsUrl);
+  const res = await fetch("http://localhost:3000/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ context }),
+  });
+
+  const data = await res.json();
+  const joinUrl = data.joinUrl;
+  connectToUltravox(joinUrl);
 });
 
-document.getElementById('stop').addEventListener('click', () => {
+document.getElementById("stop").addEventListener("click", () => {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.close();
     socket = null;
-    console.log('🛑 WebSocket closed');
+    console.log("🛑 WebSocket closed");
   }
 
   if (processor) {
@@ -46,49 +52,45 @@ document.getElementById('stop').addEventListener('click', () => {
     audioContext = null;
   }
 
-  console.log('🛑 Stopped mic stream and cleaned up');
+  console.log("🛑 Stopped mic stream and cleaned up");
 });
 
 function connectToUltravox(url) {
   socket = new WebSocket(url);
-  socket.binaryType = 'arraybuffer';
+  socket.binaryType = "arraybuffer";
 
   socket.onopen = () => {
-    console.log('✅ Connected to server WebSocket');
+    console.log("✅ Connected to Ultravox");
+    startMicStream();
   };
 
   socket.onmessage = (event) => {
     const data = event.data;
 
     if (data instanceof ArrayBuffer) {
-      console.log('🎧 Playing audio response...');
+      console.log("🎧 Playing audio response...");
       playAudio(data);
     } else {
       const msg = JSON.parse(data);
-      console.log('📨 Received message:', msg);
+      console.log("📨 Received message:", msg);
 
-      if (msg.type === 'transcript') {
-        transcriptText.textContent = msg.transcript || '...';
-      } else if (msg.type === 'response') {
-        responseText.textContent = msg.text || '(no reply)';
-      } else if (msg.type === 'playback_clear_buffer') {
+      if (msg.type === "transcript") {
+        transcriptText.textContent = msg.transcript || "...";
+      } else if (msg.type === "response") {
+        responseText.textContent = msg.text || "(no reply)";
+      } else if (msg.type === "playback_clear_buffer") {
         if (currentAudio) {
           currentAudio.pause();
-          currentAudio.src = '';
+          currentAudio.src = "";
           currentAudio = null;
-          console.log('🧹 Audio buffer cleared');
+          console.log("🧹 Audio buffer cleared by Ultravox");
         }
-      } else if (msg.type === 'connected') {
-        startMicStream(); // Start mic stream once Ultravox session is ready
-      } else if (msg.error) {
-        console.error('❌ Server error:', msg.error);
-        alert(`Error: ${msg.error}`);
       }
     }
   };
 
-  socket.onerror = (err) => console.error('❌ WebSocket error:', err);
-  socket.onclose = () => console.log('🔌 Socket closed by server');
+  socket.onerror = (err) => console.error("❌ WebSocket error:", err);
+  socket.onclose = () => console.log("🔌 Socket closed by server");
 }
 
 async function startMicStream() {
